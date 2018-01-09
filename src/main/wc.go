@@ -4,7 +4,12 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
+    "strconv"
 )
+
+func isLetter(b byte) bool {
+    return (b <= 'Z' && b >= 'A') || (b <= 'z' && b >= 'a')
+}
 
 //
 // The map function is called once for each file of input. The first
@@ -15,6 +20,28 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// TODO: you have to write this function
+    res := make([]mapreduce.KeyValue, 0)
+    index := 0
+    for index < len(contents) && !isLetter(contents[index]) {
+        index += 1
+    }
+    last_index := index
+    for index < len(contents) {
+        if !isLetter(contents[index]) {
+            res = append(res, mapreduce.KeyValue{contents[last_index:index], "1"})
+        } else {
+            index += 1
+            continue
+        }
+        for index < len(contents) && !isLetter(contents[index]) {
+            index += 1
+        }
+        last_index = index
+    }
+    if isLetter(contents[index - 1]) {
+        res = append(res, mapreduce.KeyValue{contents[last_index:index], "1"})
+    }
+    return res
 }
 
 //
@@ -24,6 +51,12 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// TODO: you also have to write this function
+    res := 0
+    for _, s := range values {
+        i, _ := strconv.Atoi(s)
+        res += i
+    }
+    return strconv.Itoa(res)
 }
 
 // Can be run in 3 ways:
