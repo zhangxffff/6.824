@@ -36,29 +36,44 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
     var wg sync.WaitGroup
-    for i := 0; i < ntasks; i++ {
-        var arg DoTaskArgs
-        arg.JobName = jobName
-        arg.Phase = phase
-        arg.NumOtherPhase = n_other
-        arg.TaskNumber = i
-        if phase == mapPhase {
-            arg.File = mapFiles[i]
-        }
-
+    failChan := make(chan int, ntasks)
+    done := make(chan int )
+    for i := ntasks - 1; i >= 0; i-- {
         wg.Add(1)
-        go func(arg DoTaskArgs) {
-            defer wg.Done()
-            ch := <-registerChan
-            ok := call(ch, "Worker.DoTask", arg, nil)
-            if ok {
-                go func() {
-                    registerChan <- ch
-                } ()
-
-            }
-        } (arg)
+        failChan <- i
     }
-    wg.Wait()
+    go func() {
+        wg.Wait()
+        close(done)
+    } ()
+
+    loop:
+    for {
+        select {
+        case <-done:
+            break loop
+        case i := <-failChan:
+            var arg DoTaskArgs
+            arg.JobName = jobName
+            arg.Phase = phase
+            arg.NumOtherPhase = n_other
+            arg.TaskNumber = i
+            if phase == mapPhase {
+                arg.File = mapFiles[i]
+            }
+            go func(arg DoTaskArgs) {
+                ch := <-registerChan
+                ok := call(ch, "Worker.DoTask", arg, nil)
+                if ok {
+                    go func() {
+                        registerChan <- ch
+                    } ()
+                    wg.Done()
+                } else {
+                    failChan <- arg.TaskNumber
+                }
+            } (arg)
+        }
+    }
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
