@@ -17,57 +17,13 @@ import (
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
 	var ntasks int
 	var n_other int // number of inputs (for reduce) or outputs (for map)
-    var arg DoTaskArgs
-    arg.JobName = jobName
-    arg.Phase = phase
 	switch phase {
 	case mapPhase:
 		ntasks = len(mapFiles)
 		n_other = nReduce
-        arg.NumOtherPhase = nReduce
-        var sg sync.WaitGroup
-        for i, file := range mapFiles {
-            arg.TaskNumber = i
-            arg.File = file
-            ch := <-registerChan
-            sg.Add(1)
-            go func(ch string, arg DoTaskArgs) {
-                defer sg.Done()
-                for {
-                    ok := call(ch, "Worker.DoTask", &arg, nil)
-                    if ok {
-                        go func() {
-                            registerChan <- ch
-                        } ()
-                        break
-                    }
-                }
-            } (ch, arg)
-        }
-        sg.Wait()
 	case reducePhase:
 		ntasks = nReduce
 		n_other = len(mapFiles)
-        arg.NumOtherPhase = len(mapFiles)
-        var sg sync.WaitGroup
-        for i := 0; i < ntasks; i++ {
-            arg.TaskNumber = i
-            ch := <-registerChan
-            sg.Add(1)
-            go func(ch string, arg DoTaskArgs) {
-                defer sg.Done()
-                for {
-                    ok := call(ch, "Worker.DoTask", arg, nil)
-                    if ok {
-                        go func() {
-                            registerChan <- ch
-                        } ()
-                        break
-                    }
-                }
-            } (ch, arg)
-        }
-        sg.Wait()
 	}
 
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
@@ -79,5 +35,30 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+    var wg sync.WaitGroup
+    for i := 0; i < ntasks; i++ {
+        var arg DoTaskArgs
+        arg.JobName = jobName
+        arg.Phase = phase
+        arg.NumOtherPhase = n_other
+        arg.TaskNumber = i
+        if phase == mapPhase {
+            arg.File = mapFiles[i]
+        }
+
+        wg.Add(1)
+        go func(arg DoTaskArgs) {
+            defer wg.Done()
+            ch := <-registerChan
+            ok := call(ch, "Worker.DoTask", arg, nil)
+            if ok {
+                go func() {
+                    registerChan <- ch
+                } ()
+
+            }
+        } (arg)
+    }
+    wg.Wait()
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
