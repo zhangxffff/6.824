@@ -19,6 +19,8 @@ package raft
 
 import "sync"
 import "labrpc"
+import "math/rand"
+import "time"
 
 // import "bytes"
 // import "encoding/gob"
@@ -37,6 +39,11 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+const (
+    FOLLOWER    = iota
+    CANDIDATER  = iota
+    LEADER      = iota
+)
 //
 // A Go object implementing a single Raft peer.
 //
@@ -49,7 +56,12 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+    term        int
+    leader      int
+    state       int
+    votedTerm   int
+    npeer       int
+    timeout     time.Duration
 }
 
 // return currentTerm and whether this server
@@ -59,6 +71,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+    term = rf.term
+    isleader = (rf.leader == rf.me)
 	return term, isleader
 }
 
@@ -94,6 +108,10 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
+type AppendEntries struct {
+    Term    int
+    Leader  int
+}
 
 
 //
@@ -102,6 +120,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+    Term    int
+    Index   int
 }
 
 //
@@ -110,6 +130,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+    IsAgree     bool
 }
 
 //
@@ -117,6 +138,11 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    if rf.votedTerm == rf.term || args.Term < rf.term {
+        reply.IsAgree = false
+    } else {
+        reply.IsAgree = true
+    }
 }
 
 //
@@ -188,6 +214,43 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) LeaderElection() bool {
+    rf.mu.Lock()
+    rf.term += 1
+    rf.state = CANDIDATER
+    rf.votedTerm = rf.term
+    rf.mu.Unlock()
+    args := make([]RequestVoteArgs, rf.npeer)
+    replys := make([]RequestVoteReply, rf.npeer)
+    oks := make([]bool, rf.npeer)
+    oks[rf.me] = true
+    var wg sync.WaitGroup
+    wg.Add(rf.npeer - 1)
+    for i := 0; i < rf.npeer; i++ {
+        if i == rf.me {
+            continue
+        }
+        args[i].Index = i
+        args[i].Term = rf.term
+        go func(i int) {
+            defer wg.Done()
+            oks[i] = rf.sendRequestVote(i, &args[i], &replys[i])
+        } (i)
+    }
+    wg.Wait()
+    count := 0
+    for i := 0; i < rf.npeer; i++ {
+        if oks[i] && replys[i].IsAgree {
+            count += 1
+        }
+    }
+    if rf.npeer < 2 * count {
+        rf.leader = rf.me
+        return true
+    }
+    return false
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -207,6 +270,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    rf.npeer = len(rf.peers)
+    rf.term = 1
+    rf.state = FOLLOWER
+    rf.votedTerm = -1
+
+    go func() {
+        r := rand.New(rand.NewSource(time.Now().UnixNano()))
+        for {
+            ok := rf.LeaderElection()
+            if ok {
+                return
+            } else {
+                time.Sleep(time.Duration(300 + r.Intn(200)) * time.Millisecond)
+            }
+        }
+    } ()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
