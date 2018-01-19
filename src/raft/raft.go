@@ -21,6 +21,7 @@ import "sync"
 import "labrpc"
 import "math/rand"
 import "time"
+import "fmt"
 
 // import "bytes"
 // import "encoding/gob"
@@ -108,11 +109,14 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
-type AppendEntries struct {
+type AppendEntriesArgs struct {
     Term    int
     Leader  int
 }
 
+type AppendEntriesReplys struct {
+    Term    int
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -179,6 +183,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
+
+}
+
+func (rf *Raft) sendAppendEntrities(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) bool {
+    ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+    return ok
+}
+
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -228,6 +241,7 @@ func (rf *Raft) LeaderElection() bool {
     wg.Add(rf.npeer - 1)
     for i := 0; i < rf.npeer; i++ {
         if i == rf.me {
+            replys[i].IsAgree = true
             continue
         }
         args[i].Index = i
@@ -244,6 +258,7 @@ func (rf *Raft) LeaderElection() bool {
             count += 1
         }
     }
+    fmt.Printf("Term %d: %d elected by %d peer\n", rf.term, rf.me, count)
     if rf.npeer < 2 * count {
         rf.leader = rf.me
         return true
@@ -274,6 +289,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.term = 1
     rf.state = FOLLOWER
     rf.votedTerm = -1
+    rf.leader = -1
 
     go func() {
         r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -282,7 +298,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
             if ok {
                 return
             } else {
-                time.Sleep(time.Duration(300 + r.Intn(200)) * time.Millisecond)
+                time.Sleep(time.Duration(r.Intn(500)) * time.Millisecond)
             }
         }
     } ()
