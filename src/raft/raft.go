@@ -60,9 +60,11 @@ type Raft struct {
     term        int
     leader      int
     state       int
-    votedTerm   int
+    voted       bool
     npeer       int
     timeout     time.Duration
+    heartbeatTimeout time.Duration
+    heartbeat    chan int
 }
 
 // return currentTerm and whether this server
@@ -73,7 +75,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
     term = rf.term
-    isleader = (rf.leader == rf.me)
+    isleader = (rf.state == LEADER)
+    //fmt.Println("Peer %d, Term %d", rf.me, rf.term)
 	return term, isleader
 }
 
@@ -142,11 +145,17 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-    if rf.votedTerm == rf.term || args.Term < rf.term {
-        reply.IsAgree = false
-    } else {
+    rf.mu.Lock()
+    //If me is behind term or me is not voted
+    if args.Term > rf.term || (!rf.voted && args.Term == rf.term) {
         reply.IsAgree = true
+        rf.voted = true
+        rf.term = args.Term
+        rf.heartbeat <-0
+    } else {
+        reply.IsAgree = false
     }
+    rf.mu.Unlock()
 }
 
 //
@@ -184,7 +193,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
-
+    rf.mu.Lock()
+    //If HeartBeat has higher or equal term, candidate goes to follower
+    if args.Term >= rf.term {
+        rf.leader = args.Leader
+        rf.term = args.Term
+        if rf.state == CANDIDATER {
+            rf.state = FOLLOWER
+        }
+        rf.heartbeat <- 0
+    }
+    reply.Term = rf.term
+    //fmt.Printf("Peer %d, My Term %d, leader Term %d.\n", rf.me, rf.term, reply.Term)
+    rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntrities(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) bool {
@@ -227,29 +248,70 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) sendHeartBeats() {
+    args := make([]AppendEntriesArgs, rf.npeer)
+    replys := make([]AppendEntriesReplys, rf.npeer)
+    //TODO stop send heartbeats when me is not leader
+    for {
+        //fmt.Printf("Leader %d send heartbeat\n", rf.me)
+        var wg sync.WaitGroup
+        wg.Add(rf.npeer)
+        for i := 0; i < rf.npeer; i++ {
+            if i == rf.me {
+                replys[i].Term = rf.term
+                wg.Done()
+                continue
+            } else {
+                go func(i int) {
+                    defer wg.Done()
+                    args[i].Leader = rf.me
+                    args[i].Term = rf.term
+                    rf.sendAppendEntrities(i, &args[i], &replys[i])
+                } (i)
+            }
+        }
+        wg.Wait()
+        for i := 0; i < rf.npeer; i++ {
+            if replys[i].Term > rf.term {
+                rf.state = FOLLOWER
+                rf.voted = false
+                go rf.enterLeaderElection()
+                fmt.Printf("Peer %d is not leader any more.\n", rf.me)
+                return
+            }
+        }
+        time.Sleep(rf.heartbeatTimeout)
+    }
+}
+
 func (rf *Raft) LeaderElection() bool {
     rf.mu.Lock()
+    if rf.voted {
+        rf.mu.Unlock()
+        return false
+    }
     rf.term += 1
     rf.state = CANDIDATER
-    rf.votedTerm = rf.term
+    rf.voted = true
     rf.mu.Unlock()
     args := make([]RequestVoteArgs, rf.npeer)
     replys := make([]RequestVoteReply, rf.npeer)
     oks := make([]bool, rf.npeer)
-    oks[rf.me] = true
     var wg sync.WaitGroup
-    wg.Add(rf.npeer - 1)
+    wg.Add(rf.npeer)
     for i := 0; i < rf.npeer; i++ {
         if i == rf.me {
             replys[i].IsAgree = true
-            continue
+            oks[i] = true
+            wg.Done()
+        } else {
+            args[i].Index = i
+            args[i].Term = rf.term
+            go func(i int) {
+                defer wg.Done()
+                oks[i] = rf.sendRequestVote(i, &args[i], &replys[i])
+            } (i)
         }
-        args[i].Index = i
-        args[i].Term = rf.term
-        go func(i int) {
-            defer wg.Done()
-            oks[i] = rf.sendRequestVote(i, &args[i], &replys[i])
-        } (i)
     }
     wg.Wait()
     count := 0
@@ -258,12 +320,40 @@ func (rf *Raft) LeaderElection() bool {
             count += 1
         }
     }
-    fmt.Printf("Term %d: %d elected by %d peer\n", rf.term, rf.me, count)
     if rf.npeer < 2 * count {
+        rf.mu.Lock()
         rf.leader = rf.me
+        rf.state = LEADER
+        rf.mu.Unlock()
+        fmt.Printf("Peer %d is now leader.\n", rf.me)
         return true
     }
     return false
+}
+
+func (rf *Raft) enterLeaderElection() {
+   r := rand.New(rand.NewSource(time.Now().UnixNano()))
+   var ms time.Duration
+   for {
+       //ok means rf has be elected as leader
+       ok := rf.LeaderElection()
+       if ok {
+           go rf.sendHeartBeats()
+           return
+       }
+       //Leader election finish, now wait for heartbeat or timeout
+       ms = time.Duration(r.Intn(100) + 300) * time.Millisecond
+       select {
+       case <-rf.heartbeat:
+           ms = time.Duration(r.Intn(100) + 300) * time.Millisecond
+           continue
+       case <-time.After(ms):
+           rf.mu.Lock()
+           rf.voted = false
+           rf.mu.Unlock()
+           continue
+       }
+   }
 }
 
 //
@@ -285,23 +375,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    //Peer start with FOLLOWER state
+    fmt.Printf("%d peers.\n", len(peers))
     rf.npeer = len(rf.peers)
-    rf.term = 1
+    rf.term = 0
     rf.state = FOLLOWER
-    rf.votedTerm = -1
+    rf.voted = false
     rf.leader = -1
+    rf.heartbeatTimeout = time.Duration(50) * time.Millisecond
+    rf.heartbeat = make(chan int, 10)
 
-    go func() {
-        r := rand.New(rand.NewSource(time.Now().UnixNano()))
-        for {
-            ok := rf.LeaderElection()
-            if ok {
-                return
-            } else {
-                time.Sleep(time.Duration(r.Intn(500)) * time.Millisecond)
-            }
-        }
-    } ()
+    //Peer try to LeaderElection
+    go rf.enterLeaderElection()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
