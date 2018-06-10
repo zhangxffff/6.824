@@ -67,6 +67,10 @@ type Raft struct {
 	heartbeatTimeout time.Duration
 	electionTimeout  time.Duration
 	heartbeat        chan int
+
+	index   int
+	logs    map[int]LogEntry
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -112,13 +116,22 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
 type AppendEntriesArgs struct {
-	Term   int
-	Leader int
+	Term    int
+	Leader  int
+	Index   int
+	Entries []LogEntry
 }
 
 type AppendEntriesReplys struct {
-	Term int
+	Term              int
+	InconsistentIndex int
 }
 
 //
@@ -138,6 +151,8 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	IsAgree bool
+	Term    int
+	Index   int
 }
 
 //
@@ -147,7 +162,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//If me is behind term or me is not voted
 	rf.mu.Lock()
-	if args.Term > rf.term || (!rf.voted && args.Term == rf.term) {
+	if args.Index < rf.index {
+		reply.IsAgree = false
+		reply.Index = rf.index
+		reply.Term = rf.term
+	} else if args.Term > rf.term || (!rf.voted && args.Term == rf.term) {
 		reply.IsAgree = true
 		rf.voted = true
 		rf.term = args.Term
@@ -195,7 +214,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
 	rf.mu.Lock()
 	//If HeartBeat has higher or equal term, candidate goes to follower
-	if args.Term >= rf.term {
+	if args.Term >= rf.term || args.Index > rf.index {
 		if rf.state == CANDIDATER {
 			rf.state = FOLLOWER
 		}
@@ -208,6 +227,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.heartbeat <- 0
 	}
 	reply.Term = rf.term
+
+	if len(args.Entries) > 0 {
+		minIndex := args.Entries[0].Index
+		if _, ok := rf.logs[minIndex-1]; !ok && minIndex != 1 {
+			reply.InconsistentIndex = minIndex
+			reply.Term = rf.term
+		} else {
+			for _, entry := range args.Entries {
+				rf.logs[entry.Index] = entry
+				msg := ApplyMsg{}
+				msg.Command = entry.Command
+				msg.Index = entry.Index
+				rf.applyCh <- msg
+			}
+			rf.index = args.Entries[len(args.Entries)-1].Index
+			reply.InconsistentIndex = -1
+			reply.Term = rf.term
+		}
+	}
 	rf.mu.Unlock()
 }
 
@@ -235,6 +273,57 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	isLeader = rf.state == LEADER
+	term = rf.term
+	index = rf.index + 1
+
+	if isLeader {
+		rf.index += 1
+		log := LogEntry{rf.index, term, command}
+		rf.logs[rf.index] = log
+		go func() {
+			for i := 0; i < rf.npeer; i++ {
+				if i != rf.me {
+					go func(i int) {
+						args := AppendEntriesArgs{}
+						args.Entries = append(args.Entries, log)
+						args.Leader = rf.me
+						args.Term = rf.term
+						var reply AppendEntriesReplys
+						ok := rf.sendAppendEntrities(i, &args, &reply)
+						if !ok || reply.InconsistentIndex == -1 {
+							return
+						}
+
+						var minIndex = reply.InconsistentIndex
+						for reply.InconsistentIndex != -1 {
+							minIndex = reply.InconsistentIndex
+							ok = rf.sendAppendEntrities(i, &args, &reply)
+							if !ok {
+								break
+							}
+
+							args.Entries[0] = rf.logs[reply.InconsistentIndex-1]
+
+						}
+
+						args.Entries = make([]LogEntry, 0)
+						for j := minIndex; j <= rf.index; j++ {
+							args.Entries = append(args.Entries, rf.logs[j])
+						}
+						rf.sendAppendEntrities(i, &args, &reply)
+					}(i)
+				} else {
+				}
+			}
+
+		}()
+
+		var msg ApplyMsg
+		msg.Command = command
+		msg.Index = rf.index
+		rf.applyCh <- msg
+	}
 
 	return index, term, isLeader
 }
@@ -264,6 +353,7 @@ func (rf *Raft) sendHeartBeats() {
 			go func(i int) {
 				args[i].Leader = rf.me
 				args[i].Term = rf.term
+				args[i].Index = rf.index
 				oks[i] = rf.sendAppendEntrities(i, &args[i], &replys[i])
 			}(i)
 		}
@@ -406,6 +496,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leader = -1
 	rf.heartbeatTimeout = time.Duration(50) * time.Millisecond
 	rf.heartbeat = make(chan int, 10)
+
+	rf.index = 0
+	rf.logs = make(map[int]LogEntry)
+	rf.applyCh = applyCh
 
 	//Peer try to LeaderElection
 	go rf.loop()
