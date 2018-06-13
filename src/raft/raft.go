@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -68,9 +69,11 @@ type Raft struct {
 	electionTimeout  time.Duration
 	heartbeat        chan int
 
-	index   int
-	logs    map[int]LogEntry
-	applyCh chan ApplyMsg
+	index         int
+	lastIndex     []int
+	commitedIndex int
+	logs          []LogEntry
+	applyCh       chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -123,15 +126,17 @@ type LogEntry struct {
 }
 
 type AppendEntriesArgs struct {
-	Term    int
-	Leader  int
-	Index   int
-	Entries []LogEntry
+	Term          int
+	Leader        int
+	Index         int
+	Entries       []LogEntry
+	CommitedIndex int
 }
 
 type AppendEntriesReplys struct {
-	Term              int
-	InconsistentIndex int
+	Term          int
+	LastIndex     int
+	CommitedIndex int
 }
 
 //
@@ -140,8 +145,8 @@ type AppendEntriesReplys struct {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term  int
-	Index int
+	Term          int
+	CommitedIndex int
 }
 
 //
@@ -162,15 +167,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//If me is behind term or me is not voted
 	rf.mu.Lock()
-	if args.Index < rf.index {
+	if args.CommitedIndex < rf.commitedIndex {
 		reply.IsAgree = false
-		reply.Index = rf.index
+		reply.Index = rf.lastIndex[rf.me]
+		reply.Term = rf.term
+	} else if args.CommitedIndex > rf.commitedIndex {
+		reply.IsAgree = true
+		reply.Index = rf.lastIndex[rf.me]
 		reply.Term = rf.term
 	} else if args.Term > rf.term || (!rf.voted && args.Term == rf.term) {
 		reply.IsAgree = true
 		rf.voted = true
 		rf.term = args.Term
 		rf.state = FOLLOWER
+		//rf.lastIndex[rf.me] = rf.commitedIndex
 	} else {
 		reply.IsAgree = false
 	}
@@ -214,38 +224,59 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
 	rf.mu.Lock()
 	//If HeartBeat has higher or equal term, candidate goes to follower
-	if args.Term >= rf.term || args.Index > rf.index {
+	if args.Term >= rf.term || args.CommitedIndex > rf.commitedIndex {
 		if rf.state == CANDIDATER {
 			rf.state = FOLLOWER
 		}
 		if args.Term > rf.term && rf.state == LEADER {
 			rf.state = FOLLOWER
+			//rf.lastIndex[rf.me] = rf.commitedIndex
 			rf.leader = args.Leader
 		}
 		rf.leader = args.Leader
 		rf.term = args.Term
 		rf.heartbeat <- 0
+	} else if args.CommitedIndex < rf.commitedIndex {
+		reply.LastIndex = rf.lastIndex[rf.me]
+		reply.Term = rf.term
+		reply.CommitedIndex = rf.commitedIndex
+		rf.mu.Unlock()
+		return
 	}
+
 	reply.Term = rf.term
 
 	if len(args.Entries) > 0 {
-		minIndex := args.Entries[0].Index
-		if _, ok := rf.logs[minIndex-1]; !ok && minIndex != 1 {
-			reply.InconsistentIndex = minIndex
-			reply.Term = rf.term
+		if rf.lastIndex[rf.me] < args.Entries[0].Index ||
+			args.Entries[0] != rf.logs[args.Entries[0].Index] {
+			reply.LastIndex = args.Entries[0].Index - 1
+			reply.CommitedIndex = rf.commitedIndex
+			rf.mu.Unlock()
+			return
 		} else {
-			for _, entry := range args.Entries {
-				rf.logs[entry.Index] = entry
-				msg := ApplyMsg{}
-				msg.Command = entry.Command
-				msg.Index = entry.Index
-				rf.applyCh <- msg
+			for i := 1; i < len(args.Entries); i++ {
+				if len(rf.logs) > args.Entries[i].Index {
+					rf.logs[args.Entries[i].Index] = args.Entries[i]
+				} else if len(rf.logs) == args.Entries[i].Index {
+					rf.logs = append(rf.logs, args.Entries[i])
+				} else {
+					fmt.Errorf("Log size to small\n")
+				}
+				rf.lastIndex[rf.me] = args.Entries[i].Index
 			}
-			rf.index = args.Entries[len(args.Entries)-1].Index
-			reply.InconsistentIndex = -1
-			reply.Term = rf.term
 		}
 	}
+	if args.CommitedIndex > rf.commitedIndex && args.CommitedIndex <= rf.lastIndex[rf.me] {
+		for i := rf.commitedIndex + 1; i <= args.CommitedIndex; i++ {
+			var msg ApplyMsg
+			msg.Command = rf.logs[i].Command
+			msg.Index = rf.logs[i].Index
+			rf.applyCh <- msg
+		}
+		rf.commitedIndex = args.CommitedIndex
+	}
+	reply.LastIndex = rf.lastIndex[rf.me]
+	reply.CommitedIndex = rf.commitedIndex
 	rf.mu.Unlock()
 }
 
@@ -275,54 +306,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	isLeader = rf.state == LEADER
 	term = rf.term
-	index = rf.index + 1
+	index = rf.lastIndex[rf.me] + 1
 
 	if isLeader {
-		rf.index += 1
-		log := LogEntry{rf.index, term, command}
-		rf.logs[rf.index] = log
-		go func() {
-			for i := 0; i < rf.npeer; i++ {
-				if i != rf.me {
-					go func(i int) {
-						args := AppendEntriesArgs{}
-						args.Entries = append(args.Entries, log)
-						args.Leader = rf.me
-						args.Term = rf.term
-						var reply AppendEntriesReplys
-						ok := rf.sendAppendEntrities(i, &args, &reply)
-						if !ok || reply.InconsistentIndex == -1 {
-							return
-						}
-
-						var minIndex = reply.InconsistentIndex
-						for reply.InconsistentIndex != -1 {
-							minIndex = reply.InconsistentIndex
-							ok = rf.sendAppendEntrities(i, &args, &reply)
-							if !ok {
-								break
-							}
-
-							args.Entries[0] = rf.logs[reply.InconsistentIndex-1]
-
-						}
-
-						args.Entries = make([]LogEntry, 0)
-						for j := minIndex; j <= rf.index; j++ {
-							args.Entries = append(args.Entries, rf.logs[j])
-						}
-						rf.sendAppendEntrities(i, &args, &reply)
-					}(i)
-				} else {
-				}
-			}
-
-		}()
-
-		var msg ApplyMsg
-		msg.Command = command
-		msg.Index = rf.index
-		rf.applyCh <- msg
+		rf.mu.Lock()
+		rf.lastIndex[rf.me] += 1
+		log := LogEntry{rf.lastIndex[rf.me], term, command}
+		rf.logs = append(rf.logs, log)
+		rf.mu.Unlock()
+		//fmt.Printf("Commited %d,\t", rf.commitedIndex)
+		//for i := 0; i < rf.npeer; i++ {
+		//	fmt.Printf("%d\t", rf.lastIndex[i])
+		//}
+		//fmt.Println("")
 	}
 
 	return index, term, isLeader
@@ -350,11 +346,50 @@ func (rf *Raft) sendHeartBeats() {
 			continue
 		} else {
 			oks[i] = false
+
+			//sendAppendEntrities
 			go func(i int) {
+				rf.mu.Lock()
 				args[i].Leader = rf.me
 				args[i].Term = rf.term
-				args[i].Index = rf.index
+				args[i].Index = rf.lastIndex[rf.me]
+				var commitedCount = 0
+				for j := 0; j < rf.npeer; j++ {
+					if rf.lastIndex[j] > rf.commitedIndex {
+						commitedCount += 1
+					}
+				}
+				if commitedCount*2 > rf.npeer {
+					rf.commitedIndex += 1
+
+					//commit one log
+					var msg ApplyMsg
+					msg.Command = rf.logs[rf.commitedIndex].Command
+					msg.Index = rf.logs[rf.commitedIndex].Index
+					rf.applyCh <- msg
+				}
+				args[i].CommitedIndex = rf.commitedIndex
+				if rf.lastIndex[rf.me] >= rf.lastIndex[i] {
+					args[i].Entries = rf.logs[rf.lastIndex[i] : rf.lastIndex[rf.me]+1]
+				}
+
+				rf.mu.Unlock()
+
 				oks[i] = rf.sendAppendEntrities(i, &args[i], &replys[i])
+				rf.mu.Lock()
+				if oks[i] {
+					rf.lastIndex[i] = replys[i].LastIndex
+					if replys[i].CommitedIndex > rf.commitedIndex {
+						rf.state = FOLLOWER
+					} else if replys[i].CommitedIndex == rf.commitedIndex &&
+						replys[i].Term > rf.term {
+						rf.state = FOLLOWER
+					}
+					if rf.state == FOLLOWER {
+						//rf.lastIndex[rf.me] = rf.commitedIndex
+					}
+				}
+				rf.mu.Unlock()
 			}(i)
 		}
 	}
@@ -411,7 +446,7 @@ func (rf *Raft) enterLeaderElection() {
 				oks[i] = true
 				checkAgree()
 			} else {
-				args[i].Index = i
+				args[i].CommitedIndex = rf.commitedIndex
 				args[i].Term = rf.term
 				oks[i] = false
 				go func(i int) {
@@ -433,6 +468,9 @@ func (rf *Raft) enterLeaderElection() {
 		rf.leader = rf.me
 		rf.state = LEADER
 		rf.voted = false
+		for i := 0; i < rf.npeer; i++ {
+			rf.lastIndex[i] = rf.lastIndex[rf.me]
+		}
 		rf.mu.Unlock()
 	case <-time.After(electionTimeout):
 		// not Leader, wait until next election
@@ -495,10 +533,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voted = false
 	rf.leader = -1
 	rf.heartbeatTimeout = time.Duration(50) * time.Millisecond
-	rf.heartbeat = make(chan int, 10)
+	rf.heartbeat = make(chan int, 100)
 
 	rf.index = 0
-	rf.logs = make(map[int]LogEntry)
+	rf.logs = make([]LogEntry, 0)
+	rf.logs = append(rf.logs, LogEntry{0, 0, 0})
+
+	rf.lastIndex = make([]int, rf.npeer)
+	for i := 0; i < rf.npeer; i++ {
+		rf.lastIndex[i] = 0
+	}
+
 	rf.applyCh = applyCh
 
 	//Peer try to LeaderElection
