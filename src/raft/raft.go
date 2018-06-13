@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"labrpc"
 	"math/rand"
@@ -74,6 +76,7 @@ type Raft struct {
 	commitedIndex int
 	logs          []LogEntry
 	applyCh       chan ApplyMsg
+	doPersist     chan int
 }
 
 // return currentTerm and whether this server
@@ -102,6 +105,23 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	rf.mu.Lock()
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.me)
+	e.Encode(rf.term)
+	e.Encode(rf.leader)
+	e.Encode(rf.state)
+	e.Encode(rf.voted)
+	e.Encode(rf.npeer)
+	e.Encode(rf.index)
+	e.Encode(rf.lastIndex)
+	e.Encode(rf.commitedIndex)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.mu.Unlock()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -117,6 +137,21 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	rf.mu.Lock()
+	d.Decode(&rf.me)
+	d.Decode(&rf.term)
+	d.Decode(&rf.leader)
+	d.Decode(&rf.state)
+	d.Decode(&rf.voted)
+	d.Decode(&rf.npeer)
+	d.Decode(&rf.index)
+	d.Decode(&rf.lastIndex)
+	d.Decode(&rf.commitedIndex)
+	d.Decode(&rf.logs)
+	rf.mu.Unlock()
 }
 
 type LogEntry struct {
@@ -278,6 +313,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.LastIndex = rf.lastIndex[rf.me]
 	reply.CommitedIndex = rf.commitedIndex
 	rf.mu.Unlock()
+	rf.doPersist <- 0
 }
 
 func (rf *Raft) sendAppendEntrities(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) bool {
@@ -362,6 +398,7 @@ func (rf *Raft) sendHeartBeats() {
 				if commitedCount*2 > rf.npeer {
 					rf.commitedIndex += 1
 
+					rf.doPersist <- 0
 					//commit one log
 					var msg ApplyMsg
 					msg.Command = rf.logs[rf.commitedIndex].Command
@@ -387,6 +424,7 @@ func (rf *Raft) sendHeartBeats() {
 					}
 					if rf.state == FOLLOWER {
 						//rf.lastIndex[rf.me] = rf.commitedIndex
+						rf.doPersist <- 0
 					}
 				}
 				rf.mu.Unlock()
@@ -520,6 +558,7 @@ func (rf *Raft) loop() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -546,11 +585,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 
-	//Peer try to LeaderElection
-	go rf.loop()
+	rf.doPersist = make(chan int, 100)
 
+	go func() {
+		for {
+			<-rf.doPersist
+			rf.persist()
+		}
+	}()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	//Peer try to LeaderElection
+	go rf.loop()
 	return rf
 }
