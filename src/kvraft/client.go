@@ -27,6 +27,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) checkLeader() {
+	var args GetArgs
+	var reply GetReply
+	for i := 0; i < ck.npeer; i++ {
+		ok := ck.servers[i].Call("RaftKV.Get", &args, &reply)
+		if ok && reply.Err == "" {
+			ck.leader = i
+			return
+		}
+	}
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -42,6 +54,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	var args GetArgs
+	var reply GetReply
+	args.Key = key
+	ok := ck.servers[ck.leader].Call("RaftKV.Get", &args, &reply)
+	if !ok {
+		return ""
+	}
+	for reply.Err != "" && reply.WrongLeader {
+		ck.checkLeader()
+		ok = ck.servers[ck.leader].Call("RaftKV.Get", &args, &reply)
+		if !ok {
+			return ""
+		}
+	}
+	if reply.Err == "" {
+		return reply.Value
+	}
 	return ""
 }
 
@@ -57,6 +86,22 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	var args PutAppendArgs
+	var reply PutAppendReply
+	args.Key = key
+	args.Op = op
+	args.Value = value
+	ok := ck.servers[ck.leader].Call("RaftKV.PutAppend", &args, &reply)
+	if !ok {
+		return ""
+	}
+	for reply.Err != "" && reply.WrongLeader {
+		ck.checkLeader()
+		ok = ck.servers[ck.leader].Call("RaftKV.PutAppend", &args, &reply)
+		if !ok {
+			return ""
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

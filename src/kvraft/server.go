@@ -43,8 +43,12 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		reply.WrongLeader = true
 	} else {
 		value, ok := kv.table[args.Key]
-		reply.Err = ok
-		reply.Value = value
+		if ok {
+			reply.Value = value
+			reply.Err = ""
+		} else {
+			reply.Err = "No such entry"
+		}
 	}
 }
 
@@ -67,8 +71,8 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}()
 		kv.rf.Start(args)
 		select {
-		case ch <- kv.applyCh:
-			reply.Err = nil
+		case <-kv.applyCh:
+			reply.Err = ""
 			reply.WrongLeader = false
 			if args.Op == "PUT" {
 				kv.table[args.Key] = args.Value
