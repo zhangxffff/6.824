@@ -4,10 +4,11 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leader int
+	npeer  int
 }
 
 func nrand() int64 {
@@ -21,6 +22,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leader = 0
+	ck.npeer = len(servers)
 	return ck
 }
 

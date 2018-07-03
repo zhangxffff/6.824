@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -16,7 +17,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-
 
 type Op struct {
 	// Your definitions here.
@@ -33,15 +33,57 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	table map[string]string
 }
-
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.WrongLeader = true
+	} else {
+		value, ok := kv.table[args.Key]
+		reply.Err = ok
+		reply.Value = value
+	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.WrongLeader = true
+	} else {
+		leaderCh := make(chan int)
+		go func() {
+			for {
+				_, isLeader := kv.rf.GetState()
+				if !isLeader {
+					leaderCh <- 1
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		kv.rf.Start(args)
+		select {
+		case ch <- kv.applyCh:
+			reply.Err = nil
+			reply.WrongLeader = false
+			if args.Op == "PUT" {
+				kv.table[args.Key] = args.Value
+			} else if args.Op == "APPEND" {
+				value, ok := kv.table[args.Key]
+				if ok {
+					kv.table[args.Key] = value + args.Value
+				} else {
+					kv.table[args.Key] = args.Value
+				}
+			}
+		case <-leaderCh:
+			reply.WrongLeader = true
+		}
+	}
 }
 
 //
